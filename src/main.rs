@@ -4,9 +4,16 @@
 
 use embassy_rp::gpio;
 use embassy_time::Timer;
-use embassy_time::{Ticker, Duration};
+// use embassy_time::{Ticker, Duration};
 use gpio::{Level, Output, Drive};
 use panic_probe as _;
+
+use embassy_rp::bind_interrupts;
+use embassy_rp::peripherals::USB;
+use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_usb_logger::ReceiverHandler;
+use log::info;
+use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 async fn shift_register_write_bit(data: &mut Output<'_>, clock: &mut Output<'_>, bit: bool) {
     Timer::after_micros(1).await;
@@ -17,18 +24,6 @@ async fn shift_register_write_bit(data: &mut Output<'_>, clock: &mut Output<'_>,
     clock.set_low();
 }
 
-async fn shift_register_write_all(data: &mut Output<'_>, clock: &mut Output<'_>, latch: &mut Output<'_>, bit: bool) {
-    for _i in 0..256 {
-        shift_register_write_bit(data, clock, bit).await;
-    }
-    latch.set_low();
-    Timer::after_micros(1).await;
-    latch.set_high();
-}
-
-// cur is a 16x16 bit array
-// each row corresponds to Y connections (cur[0] => Y0)
-// each bit in each row corresponds to Y-X connections (cur[0] bit 0 => Y0-X0)
 async fn shift_register_write(data: &mut Output<'_>, clock: &mut Output<'_>, latch: &mut Output<'_>, cur: &[u16; 16]) {
     for i in 0..16 { 
         for j in 0..16 {
@@ -44,11 +39,26 @@ async fn shift_register_write(data: &mut Output<'_>, clock: &mut Output<'_>, lat
     latch.set_high();
 }
 
-#[embassy_executor::main]
-async fn main(_spawner: embassy_executor::Spawner) {
-    let p = embassy_rp::init(Default::default()); // peripherals
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => InterruptHandler<USB>;
+});
 
-    let mut data = Output::new(p.PIN_0, Level::High); // Initial high to check output voltage
+#[embassy_executor::task]
+async fn logger_task(driver: Driver<'static, USB>) {
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver, Handler);
+}
+
+static mut CUR: [u16; 16] = [0; 16];
+static FULL: AtomicBool = AtomicBool::new(true);
+
+#[embassy_executor::main]
+async fn main(spawner: embassy_executor::Spawner) {
+    let p = embassy_rp::init(Default::default());
+
+    let driver = Driver::new(p.USB, Irqs);
+    spawner.spawn(logger_task(driver)).unwrap();
+
+    let mut data = Output::new(p.PIN_0, Level::High);
     // data.set_drive_strength(Drive::_2mA); //  730 mV
     // data.set_drive_strength(Drive::_4mA); // 1080 mV
     // data.set_drive_strength(Drive::_8mA); // 1660 mV
@@ -56,21 +66,33 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let mut clock = Output::new(p.PIN_1, Level::Low);
     let mut latch = Output::new(p.PIN_2, Level::High); // Latch is active low
 
-    // reset all to 0
-    shift_register_write_all(&mut data, &mut clock, &mut latch, false).await;
-
-    let mut ticker = Ticker::every(Duration::from_secs(2)); // 2 second delay between each tick to measure results w/ a simple ohmmeter
-    let mut cur = [ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ]; // Initial Y0 - X0 + Y1 - X0
     loop {
-        // All 0 -> All 1 loop
-        // shift_register_write_all(&mut data, &mut clock, &mut latch, false).await;
-        // ticker.next().await;
-        // shift_register_write_all(&mut data, &mut clock, &mut latch, true).await;
-        // ticker.next().await;
+        if FULL.load(Relaxed) {
+            info!("updated!");
+            // this is annothing that i need this
+            let cur = unsafe {(&raw const CUR).as_ref().unwrap()};
+            info!("{cur:x?}");
+            shift_register_write(&mut data, &mut clock, &mut latch, cur).await;
+            FULL.store(false, Relaxed);
+        }
+        embassy_futures::yield_now().await;
+    }
+}
 
-        // Shift loop
-        shift_register_write(&mut data, &mut clock, &mut latch, &cur).await;
-        cur[1] <<= 1; // move Y1 - X0 -> X1 -> X2 etc...
-        ticker.next().await;
+struct Handler;
+
+impl ReceiverHandler for Handler {
+    async fn handle_data(&self, data: &[u8]) { 
+        if data.len() != 32 {info!("invalid data length: {}", data.len()); return}
+        if FULL.load(Relaxed) {info!("already got packet!"); return}
+        info!("rx");
+        for i in 0..16 {
+            unsafe {CUR[i] = data[i * 2] as u16 | ((data[i * 2 + 1] as u16) << 8)}; // little endian
+        }
+        FULL.store(true, Relaxed);
+    }
+
+    fn new() -> Self {
+        Self
     }
 }
